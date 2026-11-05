@@ -116,7 +116,7 @@ class DockerExecProcess:
                 user=self._user,
                 environment=self._environment,
             )
-        except BaseException as error:
+        except Exception as error:
             self._error = error
         finally:
             self._complete.set()
@@ -410,12 +410,23 @@ class DockerManager:
             raw_socket = self.client.api.exec_start(exec_id, socket=True)
             sock = getattr(raw_socket, "_sock", raw_socket)
             payload = input.encode() if isinstance(input, str) else input
-            if payload:
-                sock.sendall(payload)
-            try:
-                sock.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            write_error: list[Exception] = []
+
+            # Sending stdin and draining stdout/stderr must happen concurrently:
+            # a command can produce output before it consumes all its input.
+            def write_stdin() -> None:
+                try:
+                    if payload:
+                        sock.sendall(payload)
+                    try:
+                        sock.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                except Exception as error:
+                    write_error.append(error)
+
+            writer = threading.Thread(target=write_stdin)
+            writer.start()
             stdout, stderr = bytearray(), bytearray()
             try:
                 for stream, data in frames_iter(sock, tty=False):
@@ -425,6 +436,9 @@ class DockerManager:
                         stderr.extend(data)
             finally:
                 raw_socket.close()
+                writer.join()
+            if write_error:
+                raise write_error[0]
             code = self.client.api.exec_inspect(exec_id)["ExitCode"]
             stdout, stderr = bytes(stdout), bytes(stderr)
         if text:
@@ -560,6 +574,7 @@ class DockerManager:
             return
         cls.create_shared_build_volume()
         client = docker.from_env()
+        logger = logging.getLogger(f"{PACKAGE_NAME}.{cls.__name__.lower()}")
         name = f"patchwise-init-{current_commit_sha[:8]}"
         try:
             try:
@@ -593,6 +608,14 @@ class DockerManager:
                 client.containers.get(name).remove(force=True)
             except NotFound:
                 pass
+            except DockerException as error:
+                # Preserve an initialization failure; a best-effort cleanup
+                # failure should not obscure the operation that caused it.
+                logger.warning(
+                    "Unable to remove build-volume initialization container %s: %s",
+                    name,
+                    _error_text(error),
+                )
 
     @classmethod
     def ensure_ts_cache_service(cls) -> None:
@@ -635,6 +658,7 @@ class DockerManager:
         while True:
             result = container.exec_run(["redis-cli", "ping"], demux=True)
             stdout, stderr = result.output or (b"", b"")
+            stdout, stderr = stdout or b"", stderr or b""
             if stdout.strip() == b"PONG":
                 return
             if time.monotonic() > deadline:
